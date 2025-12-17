@@ -1,0 +1,11 @@
+音频文件: 20251216_212339.webm
+============================================================
+📢 说话人区分结果（使用 SenseVoice 识别）:
+------------------------------------------------------------
+说话人 0: < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > So. This is another test .
+说话人 0: < | en | > < | SAD | > < | S pee ch | > < | withi tn | > I want to know what will happened after this .. < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > Re cording .
+说话人 0: < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > A nd . < | zh | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > < | zh | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > T hey,not < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > C over ed .
+说话人 0: < | en | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > beinging renamed , that will make more sense .
+说话人 0: < | yue | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > < | en | > < | SAD | > < | S pee ch | > < | withi tn | > I f.
+
+============================================================

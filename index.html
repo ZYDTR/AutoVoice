@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>录音应用 - 状态监控</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%;
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 28px;
+        }
+
+        .status-section {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+
+        .status-indicator {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #ccc;
+            transition: all 0.3s ease;
+        }
+
+        .status-indicator.idle {
+            background: #999;
+        }
+
+        .status-indicator.recording {
+            background: #ff4444;
+            animation: blink 1s infinite;
+        }
+
+        .status-indicator.processing {
+            background: #4488ff;
+        }
+
+        .status-indicator.uploading {
+            background: #ffaa00;
+        }
+
+        .status-indicator.success {
+            background: #44ff44;
+        }
+
+        .status-indicator.error {
+            background: #cc0000;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .status-text {
+            font-size: 18px;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .countdown {
+            color: #ff4444;
+            font-weight: bold;
+        }
+
+        .control-section {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .record-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            font-size: 18px;
+            font-weight: bold;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .record-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        .record-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .audio-section {
+            margin-bottom: 30px;
+            display: none;
+        }
+
+        .audio-section.show {
+            display: block;
+        }
+
+        .audio-section h3 {
+            margin-bottom: 10px;
+            color: #333;
+            font-size: 16px;
+        }
+
+        audio {
+            width: 100%;
+            border-radius: 10px;
+        }
+
+        .log-section {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
+        .log-section pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .log-entry {
+            margin-bottom: 5px;
+        }
+
+        .log-time {
+            color: #858585;
+        }
+
+        .log-info {
+            color: #4ec9b0;
+        }
+
+        .log-success {
+            color: #4ec9b0;
+        }
+
+        .log-error {
+            color: #f48771;
+        }
+
+        .log-warning {
+            color: #dcdcaa;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 录音应用</h1>
+
+        <div class="status-section">
+            <div class="status-indicator idle" id="statusIndicator"></div>
+            <div class="status-text" id="statusText">系统就绪</div>
+        </div>
+
+        <div class="control-section">
+            <button class="record-btn" id="recordBtn">开始录音 (30秒)</button>
+        </div>
+
+        <div class="audio-section" id="audioSection">
+            <h3>本地播放 (Blob 缓存):</h3>
+            <audio id="audioPlayer" controls></audio>
+        </div>
+
+        <div class="log-section">
+            <pre id="logArea">等待操作...</pre>
+        </div>
+    </div>
+
+    <script>
+        // 状态枚举
+        const State = {
+            IDLE: 'idle',
+            RECORDING: 'recording',
+            PROCESSING: 'processing',
+            UPLOADING: 'uploading',
+            SUCCESS: 'success',
+            ERROR: 'error'
+        };
+
+        // 全局变量
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let recordTimer = null;
+        let countdownTimer = null;
+        let currentState = State.IDLE;
+        const RECORD_DURATION = 30; // 30秒
+        const API_URL = 'http://localhost:8000/upload';
+
+        // DOM 元素
+        const statusIndicator = document.getElementById('statusIndicator');
+        const statusText = document.getElementById('statusText');
+        const recordBtn = document.getElementById('recordBtn');
+        const audioSection = document.getElementById('audioSection');
+        const audioPlayer = document.getElementById('audioPlayer');
+        const logArea = document.getElementById('logArea');
+
+        // 日志函数
+        function addLog(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString('zh-CN');
+            const logEntry = document.createElement('div');
+            logEntry.className = `log-entry log-${type}`;
+            logEntry.innerHTML = `<span class="log-time">[${timestamp}]</span> ${message}`;
+            logArea.appendChild(logEntry);
+            logArea.scrollTop = logArea.scrollHeight;
+            
+            // 同时输出到控制台
+            const consoleMethod = type === 'error' ? 'error' : type === 'success' ? 'log' : 'log';
+            console[consoleMethod](`[${timestamp}] ${message}`);
+        }
+
+        // 更新状态
+        function updateState(newState, message) {
+            currentState = newState;
+            statusIndicator.className = `status-indicator ${newState}`;
+            statusText.textContent = message;
+            addLog(`状态变更: ${message}`, 'info');
+        }
+
+        // 开始录音
+        async function startRecording() {
+            try {
+                addLog('开始请求麦克风权限...', 'info');
+                
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                addLog('麦克风权限获取成功，开始采集音频流', 'success');
+                
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                        addLog(`收到音频数据块，大小: ${event.data.size} bytes`, 'info');
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    addLog('录音停止，开始处理音频数据...', 'info');
+                    processRecording();
+                    stream.getTracks().forEach(track => track.stop());
+                };
+
+                mediaRecorder.onerror = (event) => {
+                    addLog(`录音错误: ${event.error}`, 'error');
+                    updateState(State.ERROR, `错误 - ${event.error}`);
+                    recordBtn.disabled = false;
+                };
+
+                updateState(State.RECORDING, '正在录音 (倒计时 30 秒)');
+                mediaRecorder.start();
+                addLog('MediaRecorder 已启动', 'success');
+
+                // 倒计时
+                let remaining = RECORD_DURATION;
+                countdownTimer = setInterval(() => {
+                    remaining--;
+                    if (remaining > 0) {
+                        statusText.textContent = `正在录音 (倒计时 ${remaining} 秒)`;
+                    } else {
+                        clearInterval(countdownTimer);
+                        stopRecording();
+                    }
+                }, 1000);
+
+                // 30秒后自动停止
+                recordTimer = setTimeout(() => {
+                    stopRecording();
+                }, RECORD_DURATION * 1000);
+
+                recordBtn.disabled = true;
+                recordBtn.textContent = '录音中...';
+
+            } catch (error) {
+                addLog(`捕捉到异常: ${error.message}`, 'error');
+                updateState(State.ERROR, `错误 - ${error.message}`);
+                recordBtn.disabled = false;
+            }
+        }
+
+        // 停止录音
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                addLog('MediaRecorder 已停止', 'info');
+            }
+            if (recordTimer) {
+                clearTimeout(recordTimer);
+                recordTimer = null;
+            }
+            if (countdownTimer) {
+                clearInterval(countdownTimer);
+                countdownTimer = null;
+            }
+            recordBtn.textContent = '开始录音 (30秒)';
+        }
+
+        // 处理录音数据
+        function processRecording() {
+            try {
+                updateState(State.PROCESSING, '本地已缓存 (Blob Ready)');
+                
+                const blob = new Blob(audioChunks, { type: 'audio/webm' });
+                const blobSize = blob.size;
+                const blobURL = URL.createObjectURL(blob);
+                
+                addLog(`Blob 生成成功，大小: ${blobSize} bytes (${(blobSize / 1024).toFixed(2)} KB)`, 'success');
+                addLog(`本地 URL: ${blobURL}`, 'info');
+
+                // 显示音频播放器
+                audioPlayer.src = blobURL;
+                audioSection.classList.add('show');
+                addLog('音频播放器已准备就绪', 'success');
+
+                // 立即上传
+                uploadAudio(blob);
+
+            } catch (error) {
+                addLog(`处理录音数据时出错: ${error.message}`, 'error');
+                updateState(State.ERROR, `错误 - ${error.message}`);
+                recordBtn.disabled = false;
+            }
+        }
+
+        // 上传音频
+        async function uploadAudio(blob) {
+            try {
+                updateState(State.UPLOADING, '正在上传服务器...');
+                addLog('开始向后端发送 POST 请求', 'info');
+
+                const formData = new FormData();
+                formData.append('file', blob, `recording_${Date.now()}.webm`);
+
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || `HTTP ${response.status}`);
+                }
+
+                const result = await response.json();
+                addLog(`后端响应成功，文件路径: ${result.file_path}`, 'success');
+                addLog(`绝对路径: ${result.absolute_path}`, 'info');
+                addLog(`文件大小: ${result.file_size} bytes`, 'info');
+                addLog(`上传时间: ${result.uploaded_at}`, 'info');
+
+                updateState(State.SUCCESS, '服务器保存成功');
+                recordBtn.disabled = false;
+
+            } catch (error) {
+                addLog(`上传失败: ${error.message}`, 'error');
+                updateState(State.ERROR, `错误 - ${error.message}`);
+                recordBtn.disabled = false;
+            }
+        }
+
+        // 事件监听
+        recordBtn.addEventListener('click', startRecording);
+
+        // 初始化日志
+        addLog('页面加载完成，系统就绪', 'success');
+        addLog(`后端 API 地址: ${API_URL}`, 'info');
+    </script>
+</body>
+</html>
+
+
