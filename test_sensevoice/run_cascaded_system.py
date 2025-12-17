@@ -1,6 +1,12 @@
 """
-级联系统：先 Paraformer 做 Diarization，再用 SenseVoice 识别文本
+级联系统 v3：锚点分段 + 智能对齐
 实现"用 Paraformer 定位定人，用 SenseVoice 修正内容"的方案
+
+改进内容：
+- 锚点分段：避免对齐漂移跨段传播
+- 距离约束：防止幻觉导致的指针跳跃
+- 幻觉检测：识别重复字符等异常输出
+- 分层策略：单片段/多说话人/同说话人分别处理
 """
 
 import os
@@ -8,6 +14,7 @@ import time
 import re
 import tempfile
 import traceback
+import difflib
 import numpy as np
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
@@ -30,12 +37,17 @@ except ImportError:
 # ================= 配置区域 =================
 DEVICE = "cpu"
 THREADS = 4
-DEFAULT_OUTPUT_DIR = "/Users/zhengyidi/AutoVoice/recordings"  # 默认输出目录
+DEFAULT_OUTPUT_DIR = "/Users/zhengyidi/AutoVoice/recordings"
+
+# v3 配置
+MAX_SEGMENT_DURATION_MS = 5 * 60 * 1000  # 最大对齐段时长：5分钟
+MIN_SILENCE_GAP_MS = 2000  # 锚点条件：静音超过2秒
+MIN_SIMILARITY_THRESHOLD = 0.5  # 最低相似度阈值
 # ===========================================
+
 
 def remove_emoji(text):
     """移除文本中的 emoji，保留标点符号和基本字符（包括中文）"""
-    # 注意：移除了 \U000024C2-\U0001F251 范围，因为它包含了中文字符范围
     emoji_pattern = re.compile(
         "["
         "\U0001F600-\U0001F64F"  # 表情符号
@@ -53,91 +65,396 @@ def remove_emoji(text):
     )
     return emoji_pattern.sub('', text).strip()
 
+
 def remove_sensevoice_tags(text):
+    """移除 SenseVoice 输出的标签，只保留纯文本"""
+    if not text:
+        return ""
+    tag_pattern = re.compile(r'<\s*\|[^|]*\|\s*>')
+    text = tag_pattern.sub('', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def normalize_text(text):
     """
-    移除 SenseVoice 输出的标签，只保留纯文本
-    
-    移除的标签格式：
-    - <|en|>, <|zh|>, <|yue|>, <|ja|> 等语言标签
-    - <|NEUTRAL|>, <|EMO_UNKNOWN|> 等情绪标签
-    - <|Speech|>, <|within|> 等其他标签
-    
-    注意：标签格式可能是 <|...|> 或 < | ... | >（标签内可能有空格）
+    文本标准化，用于模糊匹配
+    - 移除标点符号
+    - 转换为小写（针对英文）
     """
     if not text:
         return ""
-    
-    # 移除所有 <|...|> 格式的标签（包括标签内可能有空格的情况）
-    # 匹配 <|...|> 或 < | ... | > 等格式
-    tag_pattern = re.compile(r'<\s*\|[^|]*\|\s*>')
-    text = tag_pattern.sub('', text)
-    
-    # 清理多余的空格（多个连续空格变成一个）
-    text = re.sub(r'\s+', ' ', text)
-    
-    # 清理首尾空格
-    text = text.strip()
-    
+    # 移除所有标点符号和空格
+    text = re.sub(r'[，。！？、：；""''（）【】《》…—\s,.!?;:\'"()\[\]{}\n\r\t]+', '', text)
+    # 转换为小写
+    text = text.lower()
     return text
 
+
 def extract_audio_segment(audio_path, start_ms, end_ms, buffer_ms=100):
-    """
-    提取音频片段
-    
-    Args:
-        audio_path: 音频文件路径
-        start_ms: 开始时间（毫秒）
-        end_ms: 结束时间（毫秒）
-        buffer_ms: 前后缓冲时间（毫秒），默认100ms
-    
-    Returns:
-        audio_segment: 音频数据（numpy array）
-        sample_rate: 采样率
-    """
-    # 添加前后缓冲
+    """提取音频片段"""
     start_ms = max(0, start_ms - buffer_ms)
     end_ms = end_ms + buffer_ms
     
-    # 尝试使用 soundfile（速度快，但格式支持有限）
     if USE_SOUNDFILE:
         try:
             audio_data, sample_rate = sf.read(audio_path)
-            # 转换为采样点索引
             start_sample = int(start_ms * sample_rate / 1000)
             end_sample = int(end_ms * sample_rate / 1000)
-            # 确保不超出范围
             start_sample = max(0, start_sample)
             end_sample = min(len(audio_data), end_sample)
-            # 提取片段
             segment = audio_data[start_sample:end_sample]
             return segment, sample_rate
         except Exception:
-            # soundfile 不支持该格式，降级使用 librosa
             pass
     
-    # 使用 librosa（支持更多格式，但可能较慢）
     if USE_LIBROSA:
-        # librosa 使用秒作为单位
         start_sec = start_ms / 1000.0
         end_sec = end_ms / 1000.0
         duration = end_sec - start_sec
-        
-        # 读取指定时间段的音频
         audio_data, sample_rate = librosa.load(
-            audio_path,
-            offset=start_sec,
-            duration=duration,
-            sr=None  # 保持原始采样率
+            audio_path, offset=start_sec, duration=duration, sr=None
         )
-        
         return audio_data, sample_rate
     
     raise RuntimeError("无法读取音频文件：soundfile 和 librosa 都不可用")
 
+
+# ==================== v3 新增函数 ====================
+
+def find_alignment_anchors(sentence_info, max_segment_duration_ms=MAX_SEGMENT_DURATION_MS):
+    """
+    识别对齐锚点
+    
+    锚点类型：
+    1. 长静音段 (gap > MIN_SILENCE_GAP_MS)
+    2. 说话人切换点
+    3. 强制锚点 (每 max_segment_duration_ms 毫秒)
+    
+    返回：锚点索引列表（用于切分 sentence_info）
+    """
+    if not sentence_info:
+        return [0, 0]
+    
+    anchors = [0]  # 起始锚点
+    last_anchor_time = sentence_info[0]['start']
+    
+    for i in range(1, len(sentence_info)):
+        prev = sentence_info[i-1]
+        curr = sentence_info[i]
+        
+        # 锚点条件 1: 长静音
+        gap = curr['start'] - prev['end']
+        if gap > MIN_SILENCE_GAP_MS:
+            anchors.append(i)
+            last_anchor_time = curr['start']
+            continue
+        
+        # 锚点条件 2: 说话人切换
+        if prev.get('spk') != curr.get('spk'):
+            anchors.append(i)
+            last_anchor_time = curr['start']
+            continue
+        
+        # 锚点条件 3: 强制间隔
+        if curr['start'] - last_anchor_time > max_segment_duration_ms:
+            anchors.append(i)
+            last_anchor_time = curr['start']
+    
+    anchors.append(len(sentence_info))  # 结束锚点
+    
+    # 去重并排序
+    anchors = sorted(list(set(anchors)))
+    return anchors
+
+
+def is_likely_hallucination(para_text, match_result=None, remaining_text_len=0):
+    """
+    检测 Paraformer 输出是否可能是幻觉
+    
+    幻觉特征：
+    1. 文本很短但重复（如 "阿巴阿巴"）
+    2. 在 SenseVoice 文本中找不到相似内容
+    3. 匹配位置异常靠后
+    """
+    if not para_text:
+        return True
+    
+    # 特征 1: 重复字符检测
+    if len(para_text) >= 4:
+        unique_chars = len(set(para_text))
+        if unique_chars <= 2:  # 只有 1-2 种字符
+            return True
+    
+    # 特征 2: 无匹配或低相似度
+    if match_result is None:
+        return True
+    
+    if match_result.get('similarity', 0) < 0.4:
+        return True
+    
+    # 特征 3: 匹配位置异常（超过剩余文本的一半）
+    if remaining_text_len > 0:
+        if match_result.get('start_pos', 0) > remaining_text_len * 0.5:
+            return True
+    
+    return False
+
+
+def fuzzy_substring_search(haystack, needle, min_similarity=MIN_SIMILARITY_THRESHOLD, max_search_distance=None):
+    """
+    带距离约束的模糊子串搜索
+    
+    Args:
+        haystack: 待搜索的文本（SenseVoice 输出）
+        needle: 要查找的模式（Paraformer 片段文本）
+        min_similarity: 最低相似度阈值
+        max_search_distance: 最大搜索距离（字符数）
+    
+    Returns:
+        匹配结果字典，或 None
+    """
+    needle_normalized = normalize_text(needle)
+    
+    if not needle_normalized:
+        return None
+    
+    needle_len = len(needle_normalized)
+    
+    # 距离约束：默认为 needle 长度的 3 倍，最少 50 字符
+    if max_search_distance is None:
+        max_search_distance = max(needle_len * 3, 50)
+    
+    # 只搜索 haystack 的前 max_search_distance 个字符
+    search_text = haystack[:max_search_distance]
+    search_normalized = normalize_text(search_text)
+    
+    if not search_normalized:
+        return None
+    
+    best_match = None
+    best_score = 0
+    
+    # 滑动窗口搜索
+    for window_size in range(
+        max(1, int(needle_len * 0.5)),
+        min(len(search_normalized), int(needle_len * 2)) + 1
+    ):
+        for start in range(len(search_normalized) - window_size + 1):
+            candidate = search_normalized[start:start + window_size]
+            score = difflib.SequenceMatcher(None, needle_normalized, candidate).ratio()
+            
+            if score > best_score:
+                best_score = score
+                best_match = {
+                    'start_pos': start,
+                    'end_pos': start + window_size,
+                    'similarity': score
+                }
+    
+    if best_match and best_match['similarity'] >= min_similarity:
+        # 映射回原始文本（包含标点）
+        original_start = map_to_original_pos(search_text, best_match['start_pos'])
+        original_end = map_to_original_pos(search_text, best_match['end_pos'])
+        
+        return {
+            'text': haystack[original_start:original_end],
+            'start_pos': original_start,
+            'end_pos': original_end,
+            'similarity': best_match['similarity']
+        }
+    
+    return None
+
+
+def map_to_original_pos(original_text, normalized_pos):
+    """将标准化文本中的位置映射回原始文本"""
+    normalized_idx = 0
+    for original_idx, char in enumerate(original_text):
+        if not re.match(r'[，。！？、：；""''（）【】《》…—\s,.!?;:\'"()\[\]{}\n\r\t]', char):
+            if normalized_idx == normalized_pos:
+                return original_idx
+            normalized_idx += 1
+    return len(original_text)
+
+
+def merge_same_speaker_segments(segments):
+    """
+    合并连续的同说话人片段
+    减少需要对齐的单元数量，提高匹配准确度
+    """
+    if not segments:
+        return []
+    
+    merged = []
+    current_group = {
+        'spk': segments[0].get('spk'),
+        'start': segments[0]['start'],
+        'end': segments[0]['end'],
+        'text': segments[0].get('text', ''),
+        'original_segments': [segments[0]]
+    }
+    
+    for seg in segments[1:]:
+        if seg.get('spk') == current_group['spk']:
+            # 同说话人，合并
+            current_group['end'] = seg['end']
+            current_group['text'] += seg.get('text', '')
+            current_group['original_segments'].append(seg)
+        else:
+            # 不同说话人，保存当前组，开始新组
+            merged.append(current_group)
+            current_group = {
+                'spk': seg.get('spk'),
+                'start': seg['start'],
+                'end': seg['end'],
+                'text': seg.get('text', ''),
+                'original_segments': [seg]
+            }
+    
+    merged.append(current_group)
+    return merged
+
+
+def group_by_speaker(segments):
+    """按说话人分组（保持顺序）"""
+    return merge_same_speaker_segments(segments)
+
+
+def sequential_fuzzy_match(sensevoice_text, speaker_groups, log=print):
+    """
+    带顺序约束和距离约束的模糊匹配
+    
+    双重保护：
+    1. 顺序约束：只在 current_pos 之后搜索
+    2. 距离约束：只在合理范围内搜索，避免幻觉导致的跳跃
+    """
+    results = []
+    current_pos = 0
+    total_len = len(sensevoice_text)
+    
+    for group in speaker_groups:
+        para_text = group.get('text', '')
+        para_len = len(normalize_text(para_text))
+        
+        if para_len == 0:
+            # 空文本，跳过
+            results.append({
+                'spk': group['spk'],
+                'start': group['start'],
+                'end': group['end'],
+                'text': '',
+                'original_segments': group.get('original_segments', []),
+                'source': 'empty'
+            })
+            continue
+        
+        # 只在 current_pos 之后搜索
+        remaining_text = sensevoice_text[current_pos:]
+        remaining_len = len(remaining_text)
+        
+        # 计算合理的搜索距离
+        max_search_distance = max(para_len * 3, 50)
+        
+        match = fuzzy_substring_search(
+            haystack=remaining_text,
+            needle=para_text,
+            min_similarity=MIN_SIMILARITY_THRESHOLD,
+            max_search_distance=max_search_distance
+        )
+        
+        # 检查是否可能是幻觉
+        if is_likely_hallucination(para_text, match, remaining_len):
+            # 可能是幻觉，使用 Paraformer 原文，小步前进
+            results.append({
+                'spk': group['spk'],
+                'start': group['start'],
+                'end': group['end'],
+                'text': remove_emoji(para_text),
+                'original_segments': group.get('original_segments', []),
+                'source': 'paraformer_hallucination'
+            })
+            # 小步前进
+            current_pos += min(para_len, 20)
+            continue
+        
+        if match:
+            # 检查匹配位置是否合理
+            if match['start_pos'] > max_search_distance * 0.8:
+                # 匹配位置接近搜索边界，可能是误匹配
+                results.append({
+                    'spk': group['spk'],
+                    'start': group['start'],
+                    'end': group['end'],
+                    'text': remove_emoji(para_text),
+                    'original_segments': group.get('original_segments', []),
+                    'source': 'paraformer_suspicious'
+                })
+                current_pos += min(para_len, 20)
+            else:
+                # 正常匹配
+                absolute_end = current_pos + match['end_pos']
+                matched_text = match['text'].strip()
+                
+                results.append({
+                    'spk': group['spk'],
+                    'start': group['start'],
+                    'end': group['end'],
+                    'text': matched_text if matched_text else remove_emoji(para_text),
+                    'original_segments': group.get('original_segments', []),
+                    'similarity': match['similarity'],
+                    'source': 'sensevoice_fuzzy'
+                })
+                current_pos = absolute_end
+        else:
+            # 匹配失败，使用 Paraformer 原文
+            results.append({
+                'spk': group['spk'],
+                'start': group['start'],
+                'end': group['end'],
+                'text': remove_emoji(para_text),
+                'original_segments': group.get('original_segments', []),
+                'source': 'paraformer_fallback'
+            })
+            current_pos += min(para_len, 20)
+    
+    return results
+
+
+def expand_merged_results(merged_results):
+    """
+    将合并的结果展开回原始片段
+    对于同说话人多片段，保持合并状态
+    """
+    expanded = []
+    for r in merged_results:
+        original_segments = r.get('original_segments', [])
+        if len(original_segments) <= 1:
+            # 单片段或无原始信息，直接添加
+            expanded.append({
+                'spk_id': r['spk'],
+                'start': r['start'],
+                'end': r['end'],
+                'text': r['text'],
+                'source': r.get('source', 'unknown')
+            })
+        else:
+            # 多片段合并，保持合并状态输出
+            expanded.append({
+                'spk_id': r['spk'],
+                'start': r['start'],
+                'end': r['end'],
+                'text': r['text'],
+                'source': r.get('source', 'unknown'),
+                'merged_count': len(original_segments)
+            })
+    return expanded
+
+
+# ==================== 模型设置 ====================
+
 def setup_cascaded_models():
-    """
-    初始化级联系统所需的模型
-    """
+    """初始化级联系统所需的模型"""
     print("🔄 正在加载 Paraformer + Cam++ 模型...")
     start_time = time.time()
     
@@ -173,19 +490,22 @@ def setup_cascaded_models():
     
     return paraformer_model, sensevoice_model
 
+
+# ==================== v3 主处理函数 ====================
+
 def process_audio_cascaded(audio_path, paraformer_model, sensevoice_model, log_callback=None, log_detail_callback=None):
     """
-    级联处理音频：先 Paraformer 做 diarization，再用 SenseVoice 识别
+    级联处理 v3：锚点分段 + 智能对齐
     
     Args:
         audio_path: 音频文件路径
         paraformer_model: Paraformer + Cam++ 模型
         sensevoice_model: SenseVoice 模型
-        log_callback: 日志回调函数（可选），用于 GUI 显示
-        log_detail_callback: 详细日志回调函数（可选），用于 GUI 显示
+        log_callback: 日志回调函数（可选）
+        log_detail_callback: 详细日志回调函数（可选）
     
     Returns:
-        final_results: 最终结果列表，每个元素包含 spk_id, start, end, text
+        final_results: 最终结果列表
     """
     def log(msg, level="main"):
         if log_callback:
@@ -199,12 +519,14 @@ def process_audio_cascaded(audio_path, paraformer_model, sensevoice_model, log_c
         else:
             print(f"[{level}] {msg}")
     
-    # === 步骤 1: Paraformer 处理（获取时间戳和说话人ID） ===
+    total_start_time = time.time()
+    
+    # === 步骤 1: Paraformer 处理 ===
     log("="*60)
-    log("🔄 步骤 1/3: 使用 Paraformer 进行说话人区分...")
+    log("🔄 步骤 1/4: 使用 Paraformer 进行说话人区分...")
     log("="*60)
     
-    start_time = time.time()
+    para_start_time = time.time()
     paraformer_res = paraformer_model.generate(
         input=audio_path,
         cache={},
@@ -223,332 +545,194 @@ def process_audio_cascaded(audio_path, paraformer_model, sensevoice_model, log_c
     if not sentence_info:
         raise ValueError("Paraformer 处理失败：未检测到句子信息")
     
-    elapsed = time.time() - start_time
-    log(f"✅ 检测到 {len(sentence_info)} 个句子片段，耗时: {elapsed:.2f}秒")
+    para_elapsed = time.time() - para_start_time
+    log(f"✅ 检测到 {len(sentence_info)} 个句子片段，耗时: {para_elapsed:.2f}秒")
     
-    # === 步骤 2: 将片段按30秒窗口分组，合并后统一用 SenseVoice 识别 ===
+    # === 步骤 2: 识别对齐锚点 ===
     log("")
     log("="*60)
-    log("🔄 步骤 2/3: 将片段按30秒窗口分组，合并后用 SenseVoice 批量识别...")
+    log("🔄 步骤 2/4: 识别对齐锚点...")
     log("="*60)
     
-    # SenseVoice 内部以30秒为最优片段长度，所以我们按30秒窗口分组
-    SEGMENT_WINDOW_SEC = 30  # 30秒窗口
-    SEGMENT_WINDOW_MS = SEGMENT_WINDOW_SEC * 1000
+    anchors = find_alignment_anchors(sentence_info)
+    num_segments = len(anchors) - 1
+    log(f"📊 识别到 {num_segments} 个对齐段")
     
-    # 将 sentence_info 按30秒窗口分组
-    window_groups = []
-    current_window_start = 0
-    current_group = []
+    # 显示锚点分布
+    for i in range(num_segments):
+        start_idx = anchors[i]
+        end_idx = anchors[i + 1]
+        seg_count = end_idx - start_idx
+        if seg_count > 0:
+            start_time_ms = sentence_info[start_idx]['start']
+            end_time_ms = sentence_info[end_idx - 1]['end']
+            duration_sec = (end_time_ms - start_time_ms) / 1000
+            log(f"  对齐段 {i+1}: {seg_count} 个片段, {duration_sec:.1f}秒 ({start_time_ms}ms - {end_time_ms}ms)", "sub")
     
-    for sent_info in sentence_info:
-        start_ms = sent_info['start']
-        end_ms = sent_info['end']
+    # === 步骤 3: 分段处理 ===
+    log("")
+    log("="*60)
+    log("🔄 步骤 3/4: 分段处理（Paraformer + SenseVoice 对齐）...")
+    log("="*60)
+    
+    all_results = []
+    sense_total_time = 0
+    
+    for seg_idx in range(num_segments):
+        start_idx = anchors[seg_idx]
+        end_idx = anchors[seg_idx + 1]
+        segment_infos = sentence_info[start_idx:end_idx]
         
-        # 如果当前片段超出当前窗口，开始新窗口
-        if start_ms >= current_window_start + SEGMENT_WINDOW_MS:
-            if current_group:
-                window_groups.append({
-                    'window_start': current_window_start,
-                    'window_end': current_window_start + SEGMENT_WINDOW_MS,
-                    'segments': current_group
-                })
-            current_window_start = (start_ms // SEGMENT_WINDOW_MS) * SEGMENT_WINDOW_MS
-            current_group = []
+        if not segment_infos:
+            continue
         
-        current_group.append(sent_info)
-    
-    # 添加最后一组
-    if current_group:
-        window_groups.append({
-            'window_start': current_window_start,
-            'window_end': current_window_start + SEGMENT_WINDOW_MS,
-            'segments': current_group
-        })
-    
-    log(f"📊 将 {len(sentence_info)} 个片段分组为 {len(window_groups)} 个30秒窗口")
-    for i, group in enumerate(window_groups, 1):
-        log(f"  窗口 {i}: {len(group['segments'])} 个片段，时间范围: {group['window_start']}ms - {group['window_end']}ms", "sub")
-    
-    sensevoice_results = []
-    total_start_time = time.time()
-    
-    # 提取并合并30秒窗口的音频
-    log(f"准备提取并合并 {len(window_groups)} 个30秒窗口的音频...")
-    extract_start_time = time.time()
-    
-    window_audio_files = []
-    window_info_list = []
-    
-    for window_idx, window_group in enumerate(window_groups):
-        window_start_ms = window_group['window_start']
-        window_end_ms = window_group['window_end']
-        segments = window_group['segments']
+        # 该段的时间范围
+        seg_start_ms = segment_infos[0]['start']
+        seg_end_ms = segment_infos[-1]['end']
+        seg_duration = (seg_end_ms - seg_start_ms) / 1000
         
+        log(f"处理对齐段 {seg_idx+1}/{num_segments}: {seg_duration:.1f}秒, {len(segment_infos)} 个片段")
+        
+        # 提取该段音频
         try:
-            # 提取整个30秒窗口的音频
-            audio_segment, sample_rate = extract_audio_segment(
-                audio_path, window_start_ms, window_end_ms
-            )
-            
-            # 如果音频长度不足30秒，用静音填充（保持原始长度也可以）
-            expected_samples = int(SEGMENT_WINDOW_SEC * sample_rate)
-            if len(audio_segment) < expected_samples:
-                # 用静音填充到30秒
-                padding_samples = expected_samples - len(audio_segment)
-                if len(audio_segment.shape) == 1:
-                    # 单声道
-                    padding = np.zeros(padding_samples, dtype=audio_segment.dtype)
-                else:
-                    # 多声道
-                    padding = np.zeros((padding_samples, audio_segment.shape[1]), dtype=audio_segment.dtype)
-                audio_segment = np.concatenate([audio_segment, padding])
-            
-            # 保存为临时文件
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                tmp_path = tmp_file.name
-                if USE_SOUNDFILE:
-                    sf.write(tmp_path, audio_segment, sample_rate)
-                elif USE_LIBROSA:
-                    import soundfile as sf_write
-                    sf_write.write(tmp_path, audio_segment, sample_rate)
-                else:
-                    raise RuntimeError("无法写入音频文件：soundfile 不可用")
-            
-            window_audio_files.append(tmp_path)
-            window_info_list.append({
-                'window_idx': window_idx,
-                'window_start': window_start_ms,
-                'window_end': window_end_ms,
-                'segments': segments  # 保存原始片段信息，用于后续映射
-            })
-            
+            audio_segment, sr = extract_audio_segment(audio_path, seg_start_ms, seg_end_ms)
         except Exception as e:
-            log(f"  ❌ 提取窗口 {window_idx+1} 时出错: {str(e)}", "error")
-            log_detail(f"提取窗口 {window_idx+1} 时出错: {str(e)}", "error")
-            log_detail(traceback.format_exc(), "error")
-            # 降级：使用 Paraformer 的文本
-            for seg_info in segments:
-                text = seg_info.get('text', '')
-                text = remove_emoji(text)
-                sensevoice_results.append({
-                    'spk_id': seg_info.get('spk', 'unknown'),
-                    'start': seg_info['start'],
-                    'end': seg_info['end'],
-                    'text': text
+            log(f"  ❌ 音频提取失败: {str(e)}", "error")
+            # 降级：使用 Paraformer 原文
+            for seg in segment_infos:
+                all_results.append({
+                    'spk_id': seg.get('spk', 'unknown'),
+                    'start': seg['start'],
+                    'end': seg['end'],
+                    'text': remove_emoji(seg.get('text', '')),
+                    'source': 'paraformer_extract_failed'
                 })
-    
-    extract_time = time.time() - extract_start_time
-    log(f"✅ 30秒窗口音频提取完成，耗时: {extract_time:.2f}秒")
-    
-    # 批量处理 SenseVoice 识别（每批处理多个30秒窗口）
-    BATCH_SIZE = 8  # 每批处理8个30秒窗口
-    log(f"开始批量识别（每批 {BATCH_SIZE} 个30秒窗口）...")
-    sense_start_time = time.time()
-    
-    for batch_start in range(0, len(window_audio_files), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(window_audio_files))
-        batch_files = window_audio_files[batch_start:batch_end]
-        batch_info = window_info_list[batch_start:batch_end]
+            continue
         
-        log(f"处理批次 {batch_start//BATCH_SIZE + 1}/{(len(window_audio_files) + BATCH_SIZE - 1)//BATCH_SIZE}: 窗口 {batch_start+1}-{batch_end}")
-        
+        # SenseVoice 处理该段
+        sv_text = ""
         try:
-            # 批量调用 SenseVoice 处理30秒窗口
-            batch_sense_res = sensevoice_model.generate(
-                input=batch_files,
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                tmp_path = f.name
+                sf.write(tmp_path, audio_segment, sr)
+            
+            sense_start = time.time()
+            sv_res = sensevoice_model.generate(
+                input=tmp_path,
                 cache={},
                 language="auto",
                 use_itn=True,
             )
+            sense_total_time += time.time() - sense_start
             
-            # 处理每个30秒窗口的结果，映射回原始小片段
-            for i, (window_info, sense_res) in enumerate(zip(batch_info, batch_sense_res)):
-                window_idx = window_info['window_idx']
-                window_start_ms = window_info['window_start']
-                window_end_ms = window_info['window_end']
-                segments = window_info['segments']
-                
-                # 提取 SenseVoice 的文本
-                window_text = ""
-                if sense_res:
-                    if isinstance(sense_res, list):
-                        if len(sense_res) > 0:
-                            result_item = sense_res[0]
-                            if isinstance(result_item, dict):
-                                window_text = result_item.get('text', '')
-                            else:
-                                window_text = str(result_item)
-                    elif isinstance(sense_res, dict):
-                        window_text = sense_res.get('text', '')
+            os.unlink(tmp_path)
+            
+            # 提取 SenseVoice 文本
+            if sv_res:
+                if isinstance(sv_res, list) and len(sv_res) > 0:
+                    item = sv_res[0]
+                    if isinstance(item, dict):
+                        sv_text = item.get('text', '')
+                    elif isinstance(item, (list, tuple)) and len(item) > 0:
+                        sv_text = item[0].get('text', '') if isinstance(item[0], dict) else str(item[0])
                     else:
-                        window_text = str(sense_res) if sense_res else ""
-                
-                # 后处理：移除标签和 emoji
-                if window_text and window_text.strip():
-                    window_text = remove_sensevoice_tags(window_text)
-                    window_text = rich_transcription_postprocess(window_text)
-                    window_text = remove_emoji(window_text)
-                
-                # 将30秒窗口的文本映射回原始小片段
-                # 策略：如果窗口内只有一个片段，直接使用整个文本
-                # 如果有多个片段，按时间比例分配文本（简化处理）
-                if window_text and window_text.strip():
-                    if len(segments) == 1:
-                        # 只有一个片段，直接使用整个文本
-                        seg_info = segments[0]
-                        text = window_text
-                        spk_id = seg_info.get('spk', 'unknown')
-                        start_ms = seg_info['start']
-                        end_ms = seg_info['end']
-                        
-                        if text and text.strip():
-                            log(f"  窗口 {window_idx+1} 片段 1 (说话人 {spk_id}): {text[:50]}..." if len(text) > 50 else f"  窗口 {window_idx+1} 片段 1 (说话人 {spk_id}): {text}", "sub")
-                            sensevoice_results.append({
-                                'spk_id': spk_id,
-                                'start': start_ms,
-                                'end': end_ms,
-                                'text': text.strip()
-                            })
-                    else:
-                        # 多个片段：使用 Paraformer 的文本（因为无法准确分割 SenseVoice 的文本）
-                        log(f"  窗口 {window_idx+1} 包含 {len(segments)} 个片段，使用 Paraformer 文本", "sub")
-                        for seg_info in segments:
-                            text = seg_info.get('text', '')
-                            text = remove_emoji(text)
-                            if text and text.strip():
-                                sensevoice_results.append({
-                                    'spk_id': seg_info.get('spk', 'unknown'),
-                                    'start': seg_info['start'],
-                                    'end': seg_info['end'],
-                                    'text': text.strip()
-                                })
-                else:
-                    # SenseVoice 识别失败，降级使用 Paraformer 文本
-                    log(f"  窗口 {window_idx+1} SenseVoice 识别失败，使用 Paraformer 文本", "warning")
-                    for seg_info in segments:
-                        text = seg_info.get('text', '')
-                        text = remove_emoji(text)
-                        if text and text.strip():
-                            sensevoice_results.append({
-                                'spk_id': seg_info.get('spk', 'unknown'),
-                                'start': seg_info['start'],
-                                'end': seg_info['end'],
-                                'text': text.strip()
-                            })
+                        sv_text = str(item)
+                elif isinstance(sv_res, dict):
+                    sv_text = sv_res.get('text', '')
+            
+            # 后处理
+            if sv_text:
+                sv_text = remove_sensevoice_tags(sv_text)
+                sv_text = rich_transcription_postprocess(sv_text)
+                sv_text = remove_emoji(sv_text)
                 
         except Exception as e:
-            log(f"  ❌ 批次处理出错: {str(e)}", "error")
-            log_detail(f"批次处理出错: {str(e)}", "error")
+            log(f"  ❌ SenseVoice 处理失败: {str(e)}", "error")
             log_detail(traceback.format_exc(), "error")
-            # 降级处理：逐个处理这个批次的窗口
-            for window_info in batch_info:
-                window_idx = window_info['window_idx']
-                segments = window_info['segments']
-                tmp_path = window_audio_files[batch_start + batch_info.index(window_info)]
-                
-                try:
-                    single_res = sensevoice_model.generate(
-                        input=tmp_path,
-                        cache={},
-                        language="auto",
-                        use_itn=True,
-                    )
-                    
-                    window_text = ""
-                    if single_res:
-                        if isinstance(single_res, list):
-                            if len(single_res) > 0:
-                                result_item = single_res[0]
-                                if isinstance(result_item, dict):
-                                    window_text = result_item.get('text', '')
-                                else:
-                                    window_text = str(result_item)
-                        elif isinstance(single_res, dict):
-                            window_text = single_res.get('text', '')
-                        else:
-                            window_text = str(single_res) if single_res else ""
-                    
-                    if window_text and window_text.strip():
-                        window_text = remove_sensevoice_tags(window_text)
-                        window_text = rich_transcription_postprocess(window_text)
-                        window_text = remove_emoji(window_text)
-                        
-                        # 如果只有一个片段，直接使用
-                        if len(segments) == 1 and window_text:
-                            seg_info = segments[0]
-                            sensevoice_results.append({
-                                'spk_id': seg_info.get('spk', 'unknown'),
-                                'start': seg_info['start'],
-                                'end': seg_info['end'],
-                                'text': window_text.strip()
-                            })
-                        else:
-                            # 多个片段，使用 Paraformer 文本
-                            for seg_info in segments:
-                                text = seg_info.get('text', '')
-                                text = remove_emoji(text)
-                                if text and text.strip():
-                                    sensevoice_results.append({
-                                        'spk_id': seg_info.get('spk', 'unknown'),
-                                        'start': seg_info['start'],
-                                        'end': seg_info['end'],
-                                        'text': text.strip()
-                                    })
-                    else:
-                        # 使用 Paraformer 文本
-                        for seg_info in segments:
-                            text = seg_info.get('text', '')
-                            text = remove_emoji(text)
-                            if text and text.strip():
-                                sensevoice_results.append({
-                                    'spk_id': seg_info.get('spk', 'unknown'),
-                                    'start': seg_info['start'],
-                                    'end': seg_info['end'],
-                                    'text': text.strip()
-                                })
-                except Exception as e2:
-                    # 最终降级：使用 Paraformer 文本
-                    for seg_info in segments:
-                        text = seg_info.get('text', '')
-                        text = remove_emoji(text)
-                        if text and text.strip():
-                            sensevoice_results.append({
-                                'spk_id': seg_info.get('spk', 'unknown'),
-                                'start': seg_info['start'],
-                                'end': seg_info['end'],
-                                'text': text.strip()
-                            })
         
-        finally:
-            # 清理这个批次的临时文件
-            for tmp_path in batch_files:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except:
-                        pass
+        # === 步骤 4: 根据情况选择对齐策略 ===
+        
+        if not sv_text or not sv_text.strip():
+            # SenseVoice 失败，使用 Paraformer 原文
+            log(f"  ⚠️ SenseVoice 识别为空，使用 Paraformer 原文", "warning")
+            for seg in segment_infos:
+                text = remove_emoji(seg.get('text', ''))
+                if text.strip():
+                    all_results.append({
+                        'spk_id': seg.get('spk', 'unknown'),
+                        'start': seg['start'],
+                        'end': seg['end'],
+                        'text': text,
+                        'source': 'paraformer_sv_empty'
+                    })
+            continue
+        
+        if len(segment_infos) == 1:
+            # 情况 A: 单片段 - 直接使用 SenseVoice 文本
+            seg = segment_infos[0]
+            log(f"  ✅ 单片段，直接使用 SenseVoice: {sv_text[:30]}..." if len(sv_text) > 30 else f"  ✅ 单片段: {sv_text}", "sub")
+            all_results.append({
+                'spk_id': seg.get('spk', 'unknown'),
+                'start': seg['start'],
+                'end': seg['end'],
+                'text': sv_text,
+                'source': 'sensevoice_direct'
+            })
+        
+        else:
+            # 检查是否多说话人
+            speakers = set(s.get('spk') for s in segment_infos)
+            
+            if len(speakers) > 1:
+                # 情况 B: 多说话人 - 按说话人分组后模糊匹配
+                log(f"  🔀 多说话人 ({len(speakers)}人)，执行模糊匹配", "sub")
+                speaker_groups = group_by_speaker(segment_infos)
+                aligned = sequential_fuzzy_match(sv_text, speaker_groups, log)
+                expanded = expand_merged_results(aligned)
+                all_results.extend(expanded)
+            
+            else:
+                # 情况 C: 同说话人多片段 - 保持合并输出
+                log(f"  📝 同说话人 {len(segment_infos)} 个片段，保持合并", "sub")
+                all_results.append({
+                    'spk_id': segment_infos[0].get('spk', 'unknown'),
+                    'start': segment_infos[0]['start'],
+                    'end': segment_infos[-1]['end'],
+                    'text': sv_text,
+                    'source': 'sensevoice_merged',
+                    'merged_count': len(segment_infos)
+                })
     
-    sense_time = time.time() - sense_start_time
-    log(f"✅ SenseVoice 批量识别完成，耗时: {sense_time:.2f}秒")
-    
+    # === 完成 ===
     total_elapsed = time.time() - total_start_time
     log("")
-    log(f"✅ 所有片段处理完成，总耗时: {total_elapsed:.2f}秒")
+    log("="*60)
+    log(f"✅ 级联处理完成，总耗时: {total_elapsed:.2f}秒")
+    log(f"   - Paraformer: {para_elapsed:.2f}秒")
+    log(f"   - SenseVoice: {sense_total_time:.2f}秒")
+    log("="*60)
     
-    return sensevoice_results
+    # 统计来源
+    source_stats = {}
+    for r in all_results:
+        src = r.get('source', 'unknown')
+        source_stats[src] = source_stats.get(src, 0) + 1
+    
+    log("📊 文本来源统计:")
+    for src, count in sorted(source_stats.items()):
+        log(f"   - {src}: {count}")
+    
+    return all_results
+
 
 def format_cascaded_result(final_results, audio_file):
-    """
-    格式化级联系统的输出结果
-    """
+    """格式化级联系统的输出结果"""
     output_lines = []
     output_lines.append(f"音频文件: {os.path.basename(audio_file)}\n")
     output_lines.append("="*60 + "\n")
-    output_lines.append("📢 说话人区分结果（使用 SenseVoice 识别）:\n")
+    output_lines.append("📢 说话人区分结果（v3 锚点分段 + 智能对齐）:\n")
     output_lines.append("-"*60 + "\n")
     
-    # 过滤掉空文本的结果
     valid_results = [r for r in final_results if r.get('text', '').strip()]
     
     if not valid_results:
@@ -557,14 +741,19 @@ def format_cascaded_result(final_results, audio_file):
         for result in valid_results:
             spk_id = result['spk_id']
             text = result['text'].strip()
+            source = result.get('source', '')
+            merged = result.get('merged_count', 0)
             
-            # 只输出非空文本
             if text:
-                output_lines.append(f"说话人 {spk_id}: {text}\n")
+                line = f"说话人 {spk_id}: {text}"
+                if merged > 1:
+                    line += f" [合并{merged}段]"
+                output_lines.append(line + "\n")
     
     output_lines.append("\n" + "="*60 + "\n")
     
     return "".join(output_lines)
+
 
 if __name__ == "__main__":
     # 1. 加载模型
@@ -576,7 +765,6 @@ if __name__ == "__main__":
     if not os.path.exists(recordings_dir):
         print(f"❌ 错误: 目录 {recordings_dir} 不存在")
     else:
-        # 获取所有音频文件
         audio_files = [f for f in os.listdir(recordings_dir) 
                       if f.endswith(('.webm', '.mp3', '.wav', '.m4a', '.flac'))]
         
@@ -592,20 +780,16 @@ if __name__ == "__main__":
                 print(f"{'='*60}")
                 
                 try:
-                    # 级联处理
                     final_results = process_audio_cascaded(
                         audio_path, paraformer_model, sensevoice_model
                     )
                     
-                    # 格式化输出
                     formatted_result = format_cascaded_result(final_results, audio_file)
-                    
                     print("\n" + formatted_result)
                     
-                    # 保存结果到文件
                     output_file = os.path.join(
                         recordings_dir, 
-                        f"{os.path.splitext(audio_file)[0]}_cascaded_transcription.txt"
+                        f"{os.path.splitext(audio_file)[0]}_v3_transcription.txt"
                     )
                     with open(output_file, 'w', encoding='utf-8') as f:
                         f.write(formatted_result)
@@ -613,8 +797,6 @@ if __name__ == "__main__":
                     
                 except Exception as e:
                     print(f"❌ 处理文件 {audio_file} 时出错: {str(e)}")
-                    import traceback
                     traceback.print_exc()
             
             print(f"\n✅ 所有文件处理完成！")
-
