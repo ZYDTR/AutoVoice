@@ -297,62 +297,181 @@ def fuzzy_substring_search(haystack, needle, min_similarity=0.5):
     return None
 ```
 
-### 4.2 顺序约束优化
+### 4.2 距离约束 (Distance Constraint) ⭐ 关键优化
 
-为了避免匹配跳跃（比如匹配到后面的重复词），添加顺序约束：
+**问题**：Paraformer 可能产生幻觉（如把噪音识别成 "阿巴阿巴"），而 SenseVoice 忽略了它。
+如果在整个剩余文本中搜索，可能会错误地匹配到后面不相关的词，导致指针跳跃略过有效内容。
+
+**解决方案**：添加搜索范围限制（距离约束）
+
+```python
+def fuzzy_substring_search_with_distance_constraint(
+    haystack, 
+    needle, 
+    min_similarity=0.5,
+    max_search_distance=None  # 最大搜索距离（字符数）
+):
+    """
+    带距离约束的模糊子串搜索
+    
+    关键改进：
+    - 只在 haystack 的前 max_search_distance 个字符内搜索
+    - 避免因幻觉导致的指针大幅跳跃
+    """
+    needle_normalized = normalize_text(needle)
+    
+    if not needle_normalized:
+        return None
+    
+    needle_len = len(needle_normalized)
+    
+    # 距离约束：默认为 needle 长度的 3 倍，最少 50 字符
+    if max_search_distance is None:
+        max_search_distance = max(needle_len * 3, 50)
+    
+    # 只搜索 haystack 的前 max_search_distance 个字符
+    search_text = haystack[:max_search_distance]
+    search_normalized = normalize_text(search_text)
+    
+    best_match = None
+    best_score = 0
+    
+    # 滑动窗口搜索
+    for window_size in range(
+        max(1, int(needle_len * 0.5)),
+        min(len(search_normalized), int(needle_len * 2)) + 1
+    ):
+        for start in range(len(search_normalized) - window_size + 1):
+            candidate = search_normalized[start:start + window_size]
+            score = difflib.SequenceMatcher(None, needle_normalized, candidate).ratio()
+            
+            if score > best_score:
+                best_score = score
+                best_match = {'start_pos': start, 'end_pos': start + window_size, 'similarity': score}
+    
+    if best_match and best_match['similarity'] >= min_similarity:
+        # 映射回原始文本
+        original_start = map_to_original_pos(search_text, best_match['start_pos'])
+        original_end = map_to_original_pos(search_text, best_match['end_pos'])
+        
+        return {
+            'text': haystack[original_start:original_end],
+            'start_pos': original_start,
+            'end_pos': original_end,
+            'similarity': best_match['similarity']
+        }
+    
+    return None
+```
+
+### 4.3 顺序约束 + 距离约束组合
 
 ```python
 def sequential_fuzzy_match(sensevoice_text, paraformer_segments):
     """
-    带顺序约束的模糊匹配
+    带顺序约束和距离约束的模糊匹配
     
-    关键：每次匹配后，只在剩余文本中搜索下一个
-    这避免了匹配"跳跃"到后面的重复词
+    双重保护：
+    1. 顺序约束：只在 current_pos 之后搜索
+    2. 距离约束：只在合理范围内搜索，避免幻觉导致的跳跃
     """
     results = []
     current_pos = 0
+    total_len = len(sensevoice_text)
     
     for seg in paraformer_segments:
+        para_text = seg.get('text', '')
+        para_len = len(para_text)
+        
         # 只在 current_pos 之后搜索
         remaining_text = sensevoice_text[current_pos:]
         
-        match = fuzzy_substring_search(
+        # 计算合理的搜索距离
+        # 基于 Paraformer 文本长度，允许 3 倍扩展，最少 50 字符
+        max_search_distance = max(para_len * 3, 50)
+        
+        match = fuzzy_substring_search_with_distance_constraint(
             haystack=remaining_text,
-            needle=seg['text'],
-            min_similarity=0.5
+            needle=para_text,
+            min_similarity=0.5,
+            max_search_distance=max_search_distance
         )
         
         if match:
-            # 更新位置指针
-            absolute_start = current_pos + match['start_pos']
-            absolute_end = current_pos + match['end_pos']
-            
-            results.append({
-                'spk': seg['spk'],
-                'start': seg['start'],
-                'end': seg['end'],
-                'text': match['text'],
-                'similarity': match['similarity'],
-                'source': 'sensevoice_fuzzy'
-            })
-            
-            # 移动指针到匹配结束位置
-            current_pos = absolute_end
+            # 检查匹配位置是否合理（不应该跳跃太远）
+            if match['start_pos'] > max_search_distance * 0.8:
+                # 匹配位置接近搜索边界，可能是误匹配
+                # 降级使用 Paraformer 原文，指针小步前进
+                results.append({
+                    'spk': seg['spk'],
+                    'start': seg['start'],
+                    'end': seg['end'],
+                    'text': para_text,
+                    'source': 'paraformer_fallback_suspicious'
+                })
+                # 小步前进，避免略过有效内容
+                current_pos += min(para_len, 20)
+            else:
+                # 正常匹配
+                absolute_end = current_pos + match['end_pos']
+                
+                results.append({
+                    'spk': seg['spk'],
+                    'start': seg['start'],
+                    'end': seg['end'],
+                    'text': match['text'],
+                    'similarity': match['similarity'],
+                    'source': 'sensevoice_fuzzy'
+                })
+                
+                current_pos = absolute_end
         else:
             # 匹配失败，使用 Paraformer 原文
             results.append({
                 'spk': seg['spk'],
                 'start': seg['start'],
                 'end': seg['end'],
-                'text': seg['text'],
+                'text': para_text,
                 'source': 'paraformer_fallback'
             })
             
-            # 即使失败，也要估算移动位置（基于文本长度）
-            estimated_move = len(seg.get('text', '')) * 1.2
-            current_pos += int(estimated_move)
+            # 小步前进，保守估计
+            # 不要基于幻觉文本长度大幅移动指针
+            current_pos += min(para_len, 20)
     
     return results
+```
+
+### 4.4 幻觉检测与处理
+
+```python
+def is_likely_hallucination(para_text, match_result, remaining_text_len):
+    """
+    检测 Paraformer 输出是否可能是幻觉
+    
+    幻觉特征：
+    1. 文本很短但重复（如 "阿巴阿巴"）
+    2. 在 SenseVoice 文本中找不到相似内容
+    3. 匹配位置异常靠后
+    """
+    # 特征 1: 重复字符检测
+    if len(para_text) >= 4:
+        unique_chars = len(set(para_text))
+        if unique_chars <= 2:  # 只有 1-2 种字符
+            return True
+    
+    # 特征 2: 无匹配或低相似度
+    if match_result is None:
+        return True
+    
+    if match_result['similarity'] < 0.4:
+        return True
+    
+    # 特征 3: 匹配位置异常
+    if match_result['start_pos'] > remaining_text_len * 0.5:
+        return True
+    
+    return False
 ```
 
 ---
