@@ -1,8 +1,0 @@
-音频文件: 20251216_161952.webm
-============================================================
-📢 说话人区分结果（使用 SenseVoice 识别）:
-------------------------------------------------------------
-说话人 1: < | en | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > T his is a testing for . < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > Re cording .
-说话人 1: < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > If you record anything . < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > We will see.. < | en | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > A nd I can see , the media recorder .. < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > Is running . < | zh | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > Y eah < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > I sre cording .. < | en | > < | EMO _ UNKNOWN | > < | S pee ch | > < | withi tn | > S tream ing . < | en | > < | NEUTRAL | > < | S pee ch | > < | withi tn | > au
-
-============================================================
